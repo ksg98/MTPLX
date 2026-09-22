@@ -32,7 +32,8 @@ MTPLX exposes for the MLX runtime do not exist inside it.
 | Speculation | native MTP, tunable depth | DFlash 2 draft, fixed |
 | **KV cache** | **4-bit, 8-bit, or unquantized** | **8-bit, fixed** |
 | Context | `--context-window` | engine-planned, up to 256K |
-| Runtime settings | scheduler, batching, adaptive depth | none |
+| Sampling | temperature, top_p, top_k (0 = off), presence penalty | temperature 0–2, top_p above 0, top_k 1–32, no penalties |
+| Runtime settings | scheduler, batching, adaptive depth | sampling defaults and reasoning only |
 | Prefill history | per-chunk timings | one row per request |
 
 The KV row is the one that catches people out. Splash's Metal kernels read
@@ -83,6 +84,28 @@ what MLX sends and Splash does not: an `mtplx_progress` frame about every
 200 ms for the live tok/s chip, and `usage` plus `mtplx_stats` on the finish
 frame for each reply's footer (tok/s, out, in, cached, TTFT). A Stop sent with
 Splash's `chatcmpl-…` id cancels the request it belongs to.
+
+## The browser chat
+
+`http://127.0.0.1:8000/` serves the same MTPLX chat page on both engines — one
+function renders it (`mtplx/server/chat_page.py`), so the two cannot drift.
+On Splash the page fills a few engine slots differently: the Speculative
+section reads **DFlash 2 · on** with the package's draft length, both fixed;
+the presence-penalty slider is fixed at 0; and the Top P and Top K sliders
+span only what Splash accepts, so no setting on the page can fail a request.
+Replies carry the same stats line (`DFlash 2 73% accepted · 105.6 tok/s ·
+129 tokens · ttft 0.94s`).
+
+The page, the app's parameter panel and the app's chat share one set of live
+settings through `/v1/mtplx/settings`, as on MLX. The bridge fills them into
+any request that leaves a field out — the app's chat sends none — and a write
+outside Splash's range comes back moved to the nearest value it runs, with the
+reason, so every panel shows what the engine will actually use. MTPLX's
+`top_k: 0` (no filter) becomes 32, Splash's widest, not a greedy 1. "Hide
+thinking" reaches Splash as `reasoning_effort: "none"`, the switch it reads.
+
+With an API key set, the MLX server's browser sign-in (`/mtplx/browser-auth`)
+is not bridged yet, so open the page on a keyless local server.
 
 ## Requirements
 

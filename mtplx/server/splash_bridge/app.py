@@ -41,13 +41,54 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
+from mtplx.server.chat_page import chat_ui_html
+
 from .install import SplashInstall
 from .supervisor import SplashEngine
+from .settings import (
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
+    TOP_K_MAX,
+    TOP_K_MIN,
+    TOP_P_MIN,
+    SamplingSettings,
+)
 from .telemetry import BridgeTelemetry, conversation_key
 
 PROXY_TIMEOUT_S = 1800.0
 # How often the chat stream carries a live mtplx_progress frame.
 PROGRESS_FRAME_S = 0.2
+# The draft length both official packages compile in; shown only if a
+# package's manifest does not state its own.
+DEFAULT_DRAFT_TOKENS = 7
+
+
+def splash_engine_ui(draft_tokens: int) -> dict[str, Any]:
+    """The chat page's engine slots, filled for Splash.
+
+    Same page and layout as the MLX engine's. The speculative controls show
+    what Splash runs and stay fixed, and the sampling sliders cover exactly
+    the range Splash accepts, so no setting on the page can fail a request.
+    """
+    return {
+        "speculative_label": "DFlash 2",
+        "depth_label": "Draft tokens",
+        "depth_help": (
+            "Splash always speculates: its trained DFlash 2 draft proposes "
+            f"{draft_tokens} tokens per verify."
+        ),
+        "top_p_min": TOP_P_MIN,
+        "top_k_min": TOP_K_MIN,
+        "top_k_max": TOP_K_MAX,
+        "top_k_help": f"Splash samples from the top {TOP_K_MIN}&ndash;{TOP_K_MAX} tokens.",
+        "presence_help": "Splash samples without penalties.",
+        "locked_controls": {
+            "mtp_enabled": True,
+            "depth": draft_tokens,
+            "presence_penalty": 0,
+        },
+    }
 
 
 @functools.lru_cache(maxsize=1)
@@ -127,6 +168,14 @@ def _has_text_delta(event: dict[str, Any]) -> bool:
     return False
 
 
+def _is_reasoning_delta(event: dict[str, Any]) -> bool:
+    choices = event.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        delta = choices[0].get("delta")
+        return isinstance(delta, dict) and bool(delta.get("reasoning_content"))
+    return False
+
+
 def _finish_reason(event: dict[str, Any]) -> str | None:
     choices = event.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
@@ -169,6 +218,7 @@ def create_app(
     engine: SplashEngine,
     telemetry: BridgeTelemetry,
     api_key: str | None = None,
+    sampling: SamplingSettings | None = None,
 ) -> FastAPI:
 
     # The caller starts and stops the engine: a server that quietly booted one
@@ -178,6 +228,7 @@ def create_app(
     # Resolved once: /health is polled continuously by the app's liveness
     # probe, and this shells out to `splash --version`.
     splash_version = install.version()
+    sampling = sampling or SamplingSettings()
 
     # -- helpers ----------------------------------------------------------
 
@@ -225,6 +276,12 @@ def create_app(
             "support_level": "verified",
             "display_name": engine.model_id.split("/")[-1],
             "draft_control": {"supported": False},
+            "sampling": {
+                "temperature": DEFAULT_TEMPERATURE,
+                "top_p": DEFAULT_TOP_P,
+                "top_k": DEFAULT_TOP_K,
+                "family_default_reason": "Splash engine defaults",
+            },
             "kv_quant": telemetry.kv_quant_policy(),
             "context_window": {"supported": False, "source": "engine"},
         }
@@ -286,6 +343,9 @@ def create_app(
     def _proxy(path: str, payload: dict[str, Any]) -> Response:
         """Blocking: always reached through `run_in_threadpool`."""
         _require_ready()
+        # The live settings fill whatever the client left out, as the MLX
+        # server does: the app's own chat sends no sampling fields at all.
+        payload = sampling.apply(path, payload)
         # Splash's counters are cumulative, so a reading either side of the
         # request yields the engine's own per-request speeds and acceptance.
         entry = telemetry.begin(
@@ -389,6 +449,9 @@ def create_app(
             finished = False
             held_finish: dict[str, Any] | None = None
             held_usage: bytes | None = None
+            # Splash streams one token per frame, so thinking frames count
+            # the thinking tokens (less the two delimiters it never emits).
+            reasoning_frames = 0
             upstream_id: str | None = None
             last_progress = 0.0
 
@@ -434,7 +497,10 @@ def create_app(
                                             "cached_tokens": envelope["cached_tokens"]
                                         },
                                     }
-                                event["mtplx_stats"] = telemetry.chat_stats(envelope)
+                                stats = telemetry.chat_stats(envelope)
+                                if reasoning_frames:
+                                    stats["reasoning_tokens"] = reasoning_frames
+                                event["mtplx_stats"] = stats
                                 yield f"data: {json.dumps(event)}\n\n".encode()
                                 held_finish = None
                                 if held_usage is not None:
@@ -452,6 +518,8 @@ def create_app(
                                         upstream_id = event["id"]
                                         telemetry.alias(entry, upstream_id)
                                     text = _has_text_delta(event)
+                                    if _is_reasoning_delta(event):
+                                        reasoning_frames += 1
                                     if text:
                                         telemetry.token(entry)
                                     got = _usage(event)
@@ -583,29 +651,40 @@ def create_app(
             "chip_name": _machine_info().get("chip"),
             "unified_memory_bytes": _machine_info().get("unified_memory_bytes"),
             "speculative_decoding": "dflash2",
+            # The chat page's runtime pill reads this before anything else.
+            "runtime_mode": "Splash · DFlash 2",
         }
 
     @app.get("/", response_class=HTMLResponse)
-    def chat_page() -> Response:
-        """Splash's chat page, served by the bridge.
+    def chat_page(request: Request) -> HTMLResponse:
+        """The MTPLX chat page, the one the MLX engine serves, set for Splash.
 
-        The bridge starts the engine with `--no-webui` so there is exactly one
-        chat page rather than a second one on a private port nobody is told
-        about. Splash's page only ever posts to a relative
-        `/v1/chat/completions`, so served from here it drives the bridge — and
-        every turn lands in the dashboard's telemetry like any other client.
+        The bridge starts the engine with `--no-webui`, so this is the only
+        chat page. It posts to this server's relative routes, so every turn
+        passes through the bridge and lands in the dashboard's telemetry.
         """
-        page = install.libexec / "server/chat.html"
-        try:
-            return HTMLResponse(page.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError):
-            return HTMLResponse(
-                "<h1>MTPLX (Splash engine)</h1>"
-                f"<p>No chat page at {page}.</p>"
-                "<p>The API is live: "
-                "<code>POST /v1/chat/completions</code></p>",
-                status_code=200,
+        settings = sampling.payload()
+        draft = install.draft_tokens(engine.model_id) or DEFAULT_DRAFT_TOKENS
+        return HTMLResponse(
+            chat_ui_html(
+                model_id=engine.model_id,
+                server_url=str(request.base_url).rstrip("/"),
+                api_key_required=bool(api_key),
+                default_settings={
+                    "temperature": settings["temperature"],
+                    "top_p": settings["top_p"],
+                    "top_k": settings["top_k"],
+                    "presence_penalty": 0.0,
+                    "depth": draft,
+                    "depth_max": draft,
+                    "mtp_enabled": True,
+                    "max_tokens": settings["max_response_tokens"] or 16384,
+                    "reasoning": settings["reasoning"],
+                    "system": "",
+                },
+                engine_ui=splash_engine_ui(draft),
             )
+        )
 
     @app.get("/ready")
     def ready() -> Response:
@@ -697,16 +776,27 @@ def create_app(
         history = telemetry.dashboard.prefill_history
         return {"capacity": history.capacity(), "history": history.snapshot()}
 
+    def _settings_payload() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "model": engine.model_id,
+            **telemetry.settings(),
+            **sampling.payload(),
+            "draft_tokens": install.draft_tokens(engine.model_id),
+        }
+
     @app.get("/v1/mtplx/settings")
     def get_settings() -> dict[str, Any]:
-        return telemetry.settings()
+        return _settings_payload()
 
     @app.post("/v1/mtplx/settings")
     async def post_settings(request: Request) -> dict[str, Any]:
         _authorize(request)
-        # Splash exposes no runtime-mutable generation settings; accepting a
-        # write and silently dropping it would be worse than refusing it.
-        return telemetry.settings()
+        report = sampling.update(await _json_body(request))
+        # The reply carries the values now in force plus what moved or was
+        # ignored, so a panel that wrote an unsupported value snaps to the
+        # one Splash will actually use rather than silently diverging.
+        return {**_settings_payload(), **report}
 
     @app.post("/v1/mtplx/cancel/{request_id}")
     def cancel(request_id: str) -> dict[str, Any]:

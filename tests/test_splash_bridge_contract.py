@@ -57,6 +57,9 @@ FAKE_STATUS = {
 # a fake Splash engine over HTTP
 # --------------------------------------------------------------------------
 
+# Every generation body the fake engine received, newest last.
+RECEIVED: list[dict] = []
+
 
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):  # keep pytest output clean
@@ -83,6 +86,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         request = json.loads(self.rfile.read(length) or b"{}")
+        if self.path.startswith("/v1/"):
+            RECEIVED.append(request)
         messages = request.get("messages") or [{}]
         # Only generation is slow; templating and tokenizing run no model.
         if self.path.startswith("/v1/") and messages[-1].get("content") == "slow":
@@ -493,6 +498,8 @@ def test_the_chat_stream_carries_the_stats_the_app_renders(client):
     stats = finish["mtplx_stats"]
     assert stats["completion_tokens"] == 4
     assert stats["generation_mode"] == "splash"
+    # The chat page's stats line reads "N thinking" from this.
+    assert stats["reasoning_tokens"] == 1
     # We asked Splash for usage; the client did not, so no usage-only frame.
     assert not any(f.get("choices") == [] for f in frames)
 
@@ -528,6 +535,168 @@ def test_cancel_by_the_id_the_client_saw():
     assert trace.cancelled
     telemetry.finish(trace)
     assert not telemetry.cancel("chatcmpl-up"), "aliases die with the request"
+
+
+# --------------------------------------------------------------------------
+# the browser chat page: MTPLX's own, for both engines
+# --------------------------------------------------------------------------
+
+
+def _element_ids(page):
+    return set(re.findall(r'id="([^"]+)"', page))
+
+
+def test_the_chat_page_is_the_mlx_engines_page(client):
+    """Splash served Inco's own chat page, so switching engines swapped the
+    whole browser UI. It must be MTPLX's page, element for element."""
+    from mtplx.server.chat_page import chat_ui_html
+
+    page = client.get("/").text
+    mlx_page = chat_ui_html(
+        model_id=MODEL,
+        server_url="http://testserver",
+        api_key_required=False,
+        default_settings={"depth": 3, "depth_max": 3},
+    )
+    assert "<title>MTPLX</title>" in page
+    assert _element_ids(page) == _element_ids(mlx_page)
+    assert f"const MODEL_ID = {json.dumps(MODEL)};" in page
+    for section in ("Sampling", "Speculative", "Output", "System prompt"):
+        assert f'<p class="sb-title">{section}</p>' in page
+
+
+def test_the_chat_page_shows_what_splash_runs(client):
+    page = client.get("/").text
+    # Speculation is Splash's DFlash 2 draft, fixed, not MTPLX's MTP.
+    assert '<label for="ctl-mtp">DFlash 2 <span' in page
+    assert '<label for="ctl-depth">Draft tokens <span' in page
+    assert '"depth": 7' in page and '"mtp_enabled": true' in page
+    # Sliders span exactly what Splash accepts, so none can fail a request.
+    assert '<input id="ctl-top-k" type="range" min="1" max="32"' in page
+    assert '<input id="ctl-top-p" type="range" min="0.01" max="1"' in page
+    assert '"presence_penalty": 0' in page
+
+
+def test_every_route_the_chat_page_calls_answers(client):
+    page = client.get("/").text
+    routes = set(re.findall(r'fetch\("(/[^"]*)"', page))
+    assert routes == {"/health", "/v1/mtplx/settings", "/v1/chat/completions"}
+    assert client.get("/health").status_code == 200
+    assert client.get("/v1/mtplx/settings").status_code == 200
+    health = client.get("/health").json()
+    assert health["runtime_mode"] == "Splash · DFlash 2"
+    assert health["context_window"] > 0
+
+
+# --------------------------------------------------------------------------
+# live settings: shared by the app's panel and the chat page, applied to turns
+# --------------------------------------------------------------------------
+
+
+def test_settings_carry_the_fields_the_chat_page_reads(client):
+    settings = client.get("/v1/mtplx/settings").json()
+    for key in ("temperature", "top_p", "top_k", "presence_penalty", "reasoning"):
+        assert key in settings
+    assert settings["generation_mode"] == "splash"
+    assert 1 <= settings["top_k"] <= 32
+
+
+def test_a_settings_write_lands_and_snaps_to_what_splash_runs(client):
+    written = client.post(
+        "/v1/mtplx/settings",
+        json={
+            "temperature": 0.7,
+            "top_k": 50,
+            "presence_penalty": 1.5,
+            "generation_mode": "mtp",
+            "depth": 3,
+            "max_response_tokens": 4096,
+            "reasoning": "off",
+        },
+    ).json()
+    assert written["temperature"] == 0.7
+    assert written["top_k"] == 32, "top_k past Splash's 32 must snap, not fail turns"
+    assert written["presence_penalty"] == 0.0
+    assert set(written["adjusted"]) == {"top_k", "presence_penalty"}
+    assert set(written["ignored"]) == {"generation_mode", "depth"}
+    assert written["reasoning"] == "off"
+    # And it stays written: the chat page polls this every 1.5 s.
+    again = client.get("/v1/mtplx/settings").json()
+    assert (again["temperature"], again["top_k"], again["max_response_tokens"]) == (
+        0.7,
+        32,
+        4096,
+    )
+
+
+def test_top_k_off_becomes_splashs_widest_not_greedy():
+    """MTPLX's top_k 0 means no filter; top-1 would silently make it greedy."""
+    from mtplx.server.splash_bridge.settings import SamplingSettings
+
+    settings = SamplingSettings()
+    report = settings.update({"top_k": 0})
+    assert settings.top_k == 32
+    assert "top_k" in report["adjusted"]
+    settings.update({"top_k": -3})
+    assert settings.top_k == 1
+
+
+def test_reasoning_wins_over_the_legacy_thinking_flag():
+    from mtplx.server.splash_bridge.settings import SamplingSettings
+
+    settings = SamplingSettings()
+    settings.update({"reasoning": "auto", "enable_thinking": True})
+    assert settings.reasoning == "auto"
+    settings.update({"enable_thinking": False})
+    assert settings.reasoning == "off"
+
+
+def test_live_settings_fill_what_the_app_chat_leaves_out(client):
+    """The app's chat sends no sampling fields; the panel's values must reach
+    the engine rather than Splash's built-in defaults."""
+    client.post(
+        "/v1/mtplx/settings",
+        json={"temperature": 0.4, "top_p": 0.8, "top_k": 8, "reasoning": "off"},
+    )
+    RECEIVED.clear()
+    client.post(
+        "/v1/chat/completions",
+        json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    sent = RECEIVED[-1]
+    assert (sent["temperature"], sent["top_p"], sent["top_k"]) == (0.4, 0.8, 8)
+    # Splash ignores enable_thinking; "off" has to arrive as reasoning_effort.
+    assert sent["reasoning_effort"] == "none"
+
+
+def test_a_clients_own_values_win_over_live_settings(client):
+    client.post("/v1/mtplx/settings", json={"temperature": 0.4, "reasoning": "off"})
+    RECEIVED.clear()
+    client.post(
+        "/v1/chat/completions",
+        json={
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 1.2,
+            "enable_thinking": True,
+        },
+    )
+    sent = RECEIVED[-1]
+    assert sent["temperature"] == 1.2
+    assert "reasoning_effort" not in sent, "an explicit thinking request stands"
+
+
+def test_hide_thinking_from_the_chat_page_reaches_splash(client):
+    RECEIVED.clear()
+    client.post(
+        "/v1/chat/completions",
+        json={
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "enable_thinking": False,
+        },
+    )
+    assert RECEIVED[-1]["reasoning_effort"] == "none"
 
 
 def test_chat_page_is_served_and_drives_the_bridge(client):

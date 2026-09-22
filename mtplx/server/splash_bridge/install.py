@@ -15,6 +15,7 @@ verification would be the one part of Splash we must never get subtly wrong.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -185,6 +186,24 @@ class SplashInstall:
     def is_installed(self, model_id: str) -> bool:
         """True once Splash has verified the package against its manifest."""
         return (self.package_root(model_id) / "manifest.json").is_file()
+
+    def draft_tokens(self, model_id: str) -> int | None:
+        """How many tokens the package's DFlash 2 draft proposes per verify.
+
+        Compiled into the package (``execution_geometry`` in its manifest), so
+        it is read rather than configured. None when the package is not
+        installed or does not say.
+        """
+        try:
+            manifest = json.loads(
+                (self.package_root(model_id) / "manifest.json").read_text()
+            )
+            value = manifest["execution_geometry"]["draft_proposal_tokens"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return None
 
     def prepare(
         self,

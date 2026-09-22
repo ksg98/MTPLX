@@ -113,6 +113,26 @@ final class SplashBridgeDecodingTests: XCTestCase {
         XCTAssertNotNil(policy.disabledReason, "a locked control must say why")
     }
 
+    /// The params panel writes through /v1/mtplx/settings and adopts the
+    /// reply. Splash's reply carries the values it will actually run, so a
+    /// top_k past its 32 comes back as 32 and the panel follows.
+    func testSettingsReplyCarriesTheValuesSplashRuns() throws {
+        let current = try decoder.decode(
+            MutableSettings.self, from: fixture("splash_mtplx_settings")
+        )
+        XCTAssertNotNil(current.temperature)
+        XCTAssertNotNil(current.topK)
+        XCTAssertEqual(current.samplingDefaults?.topK, 20)
+        let updated = try decoder.decode(
+            MutableSettings.self, from: fixture("splash_mtplx_settings_update")
+        )
+        XCTAssertEqual(updated.temperature, 0.7)
+        XCTAssertEqual(updated.topK, 32)
+        XCTAssertEqual(updated.presencePenalty, 0)
+        XCTAssertEqual(updated.reasoning, "on")
+        XCTAssertEqual(updated.generationMode, "splash")
+    }
+
     func testRemainingContractEndpointsDecode() throws {
         let sessions = try decoder.decode(
             SessionsPayload.self, from: fixture("splash_admin_sessions")
