@@ -122,13 +122,23 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
-        for token in ("He", "llo", "!"):
-            frame = {"choices": [{"delta": {"content": token}, "index": 0}]}
+        # The shape a live Splash 1.0.2 stream has: an id on every frame,
+        # thinking in reasoning_content, then a bare finish frame.
+        deltas = [{"reasoning_content": "Hm"}] + [
+            {"content": token} for token in ("He", "llo", "!")
+        ]
+        for delta in deltas:
+            frame = {"id": "chatcmpl-up", "choices": [{"delta": delta, "index": 0}]}
             self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
             self.wfile.flush()
+        finish = {
+            "id": "chatcmpl-up",
+            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+        }
+        self.wfile.write(f"data: {json.dumps(finish)}\n\n".encode())
         # Splash only emits the trailing usage frame when it is asked to.
         if (request.get("stream_options") or {}).get("include_usage"):
-            final = {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 3}}
+            final = {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 4}}
             self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -433,12 +443,12 @@ def test_streaming_counts_prompt_tokens_without_changing_the_client_stream(clien
     ) as response:
         body = "".join(response.iter_text())
 
-    assert '"usage"' not in body, "client did not ask for usage and must not get it"
+    assert '"choices": []' not in body, "client did not ask for a usage frame"
     assert body.rstrip().endswith("[DONE]")
 
     lifetime = client.get("/v1/mtplx/snapshot").json()["lifetime"]
     assert lifetime["prompt_tokens_total"] == 11, "prompt tokens must be accounted"
-    assert lifetime["completion_tokens_total"] == 3
+    assert lifetime["completion_tokens_total"] == 4
 
 
 def test_a_client_that_asks_for_usage_still_receives_it(client):
@@ -453,6 +463,71 @@ def test_a_client_that_asks_for_usage_still_receives_it(client):
     ) as response:
         body = "".join(response.iter_text())
     assert '"usage"' in body, "an explicit include_usage must be forwarded"
+
+
+def _frames(body):
+    return [
+        json.loads(line[5:])
+        for line in body.splitlines()
+        if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]")
+    ]
+
+
+def test_the_chat_stream_carries_the_stats_the_app_renders(client):
+    """The app's chat footer and tok/s chip read mtplx_stats and usage off the
+    finish frame; a Splash reply without them rendered a blank footer."""
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as response:
+        body = "".join(response.iter_text())
+    assert body.rstrip().endswith("data: [DONE]")
+    frames = _frames(body)
+    finishes = [f for f in frames if (f.get("choices") or [{}])[0].get("finish_reason")]
+    assert len(finishes) == 1
+    finish = finishes[0]
+    assert finish is frames[-1], "the finish frame must stay last"
+    assert finish["usage"]["prompt_tokens"] == 11
+    assert finish["usage"]["completion_tokens"] == 4
+    stats = finish["mtplx_stats"]
+    assert stats["completion_tokens"] == 4
+    assert stats["generation_mode"] == "splash"
+    # We asked Splash for usage; the client did not, so no usage-only frame.
+    assert not any(f.get("choices") == [] for f in frames)
+
+
+def test_a_client_that_asks_for_usage_gets_one_usage_frame(client):
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+    frames = _frames(body)
+    assert [f for f in frames if f.get("choices") == []] == [frames[-1]]
+
+
+def test_thinking_tokens_move_the_live_gauge():
+    from mtplx.server.splash_bridge.app import _has_text_delta
+
+    assert _has_text_delta({"choices": [{"delta": {"reasoning_content": "Hm"}}]})
+
+
+def test_cancel_by_the_id_the_client_saw():
+    """The app stops a reply by the chatcmpl id on the stream, which is
+    Splash's, not the bridge's own request id."""
+    telemetry = BridgeTelemetry("incoai/Qwen3.8-27B-Splash")
+    trace = telemetry.begin("hi")
+    telemetry.alias(trace, "chatcmpl-up")
+    assert telemetry.cancel("chatcmpl-up")
+    assert trace.cancelled
+    telemetry.finish(trace)
+    assert not telemetry.cancel("chatcmpl-up"), "aliases die with the request"
 
 
 def test_chat_page_is_served_and_drives_the_bridge(client):

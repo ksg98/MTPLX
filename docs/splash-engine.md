@@ -75,6 +75,14 @@ Splash speculates on every decode, so draft acceptance is real and is
 reported per request, labelled `draft: dflash2` to keep it distinct from
 MTPLX's MTP. It varies a lot with content: on an M3 Max, a code prompt ran at
 72 tok/s with 84% of drafts accepted, and a prose prompt at 36 tok/s with 34%.
+On Splash 1.0.2 a short code prompt decoded at 96 tok/s (62% accepted) on the
+same machine; a single sample, not a benchmark.
+
+The app's chat reads the same stream fields from both engines. The bridge adds
+what MLX sends and Splash does not: an `mtplx_progress` frame about every
+200 ms for the live tok/s chip, and `usage` plus `mtplx_stats` on the finish
+frame for each reply's footer (tok/s, out, in, cached, TTFT). A Stop sent with
+Splash's `chatcmpl-…` id cancels the request it belongs to.
 
 ## Requirements
 

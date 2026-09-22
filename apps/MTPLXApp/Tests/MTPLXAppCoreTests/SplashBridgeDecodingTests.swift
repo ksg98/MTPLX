@@ -125,4 +125,49 @@ final class SplashBridgeDecodingTests: XCTestCase {
         let models = try decoder.decode(ModelsResponse.self, from: fixture("splash_models"))
         XCTAssertEqual(models.data.first?.id, "incoai/Qwen3.8-27B-Splash")
     }
+
+    // MARK: Chat stream
+
+    private var chatClient: MTPLXChatClient {
+        MTPLXChatClient(apiClient: MTPLXAPIClient(baseURL: URL(string: "http://127.0.0.1:1")!))
+    }
+
+    private func frame(_ name: String) throws -> String {
+        String(decoding: try fixture(name), as: UTF8.self)
+    }
+
+    /// The chat's per-reply footer (tok/s, out, in, TTFT) is built from the
+    /// finish frame's usage and mtplx_stats. A Splash reply that lacked them
+    /// rendered with no footer at all.
+    func testSplashFinishFrameCarriesTheChatFooterStats() throws {
+        let events = try XCTUnwrap(
+            chatClient.streamEvents(fromDataPayload: frame("splash_chat_finish_frame"))
+        )
+        guard case .finished(let reason, let usage, let stats)? = events.last else {
+            return XCTFail("expected .finished, got \(events)")
+        }
+        XCTAssertEqual(reason, "stop")
+        XCTAssertEqual(usage?.promptTokens, 61)
+        XCTAssertEqual(usage?.completionTokens, 92)
+        // The footer's "cached" item reads the OpenAI-standard usage detail.
+        XCTAssertEqual(usage?.cachedTokens, 0)
+        let tokS = try XCTUnwrap(stats?.rawDecodeTokS)
+        XCTAssertGreaterThan(tokS, 0)
+        XCTAssertGreaterThan(try XCTUnwrap(stats?.ttftS), 0)
+        // The held header reading divides these two.
+        XCTAssertNotNil(stats?.raw.values["completion_tokens"])
+        XCTAssertNotNil(stats?.raw.values["decode_elapsed_s"])
+    }
+
+    /// The live tok/s chip in the chat header moves on mtplx_progress frames.
+    func testSplashProgressFrameDrivesTheLiveChip() throws {
+        let events = try XCTUnwrap(
+            chatClient.streamEvents(fromDataPayload: frame("splash_chat_progress_frame"))
+        )
+        guard case .progress(let progress)? = events.first else {
+            return XCTFail("expected .progress, got \(events)")
+        }
+        XCTAssertGreaterThan(try XCTUnwrap(progress.completionTokens), 0)
+        XCTAssertNotNil(progress.raw.values["decode_elapsed_s"])
+    }
 }

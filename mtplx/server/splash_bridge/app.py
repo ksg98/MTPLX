@@ -46,6 +46,8 @@ from .supervisor import SplashEngine
 from .telemetry import BridgeTelemetry, conversation_key
 
 PROXY_TIMEOUT_S = 1800.0
+# How often the chat stream carries a live mtplx_progress frame.
+PROGRESS_FRAME_S = 0.2
 
 
 @functools.lru_cache(maxsize=1)
@@ -113,12 +115,24 @@ def _has_text_delta(event: dict[str, Any]) -> bool:
             if not isinstance(choice, dict):
                 continue
             delta = choice.get("delta")
-            if isinstance(delta, dict) and delta.get("content"):
+            # Thinking tokens are decoded like any other; skipping them left
+            # the live gauge at zero for the whole reasoning phase.
+            if isinstance(delta, dict) and (
+                delta.get("content") or delta.get("reasoning_content")
+            ):
                 return True
     delta = event.get("delta")  # Anthropic content_block_delta
     if isinstance(delta, dict) and (delta.get("text") or delta.get("partial_json")):
         return True
     return False
+
+
+def _finish_reason(event: dict[str, Any]) -> str | None:
+    choices = event.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        reason = choices[0].get("finish_reason")
+        return reason if isinstance(reason, str) else None
+    return None
 
 
 def _is_usage_only(event: dict[str, Any]) -> bool:
@@ -339,9 +353,57 @@ def create_app(
             )
             return Response(content=raw, status_code=code, media_type="application/json")
 
+        # The MLX engine decorates its chat stream with `mtplx_progress`
+        # frames and an `mtplx_stats` + usage block on the finish frame; the
+        # app's chat reads both for its live tok/s chip and per-reply footer.
+        # Splash sends neither, so the bridge adds them.
+        decorate = path == "/v1/chat/completions"
+
+        def progress_frame(upstream_id: str, created: Any, model: Any) -> bytes:
+            now = time.perf_counter()
+            first = entry.first_token_perf or now
+            decode_s = now - first
+            progress: dict[str, Any] = {
+                "phase": "generating",
+                "completion_tokens": entry.frames,
+                "decode_elapsed_s": decode_s,
+                "elapsed_s": now - entry.started_perf,
+                "ttft_s": first - entry.started_perf,
+                "generation_mode": "splash",
+            }
+            if decode_s > 0.05 and entry.frames > 1:
+                progress["decode_tok_s"] = (entry.frames - 1) / decode_s
+            frame = {
+                "id": upstream_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                "mtplx_progress": progress,
+            }
+            return f"data: {json.dumps(frame)}\n\n".encode()
+
         def stream() -> Iterator[bytes]:
             prompt = completion = cached = 0
             cancelled = False
+            finished = False
+            held_finish: dict[str, Any] | None = None
+            held_usage: bytes | None = None
+            upstream_id: str | None = None
+            last_progress = 0.0
+
+            def close_out() -> dict[str, Any]:
+                nonlocal finished
+                finished = True
+                return telemetry.finish(
+                    entry,
+                    status=engine.status(),
+                    prompt_tokens=prompt or None,
+                    completion_tokens=completion or None,
+                    cached_tokens=cached,
+                    cancelled=cancelled,
+                )
+
             try:
                 with urllib.request.urlopen(upstream, timeout=PROXY_TIMEOUT_S) as response:
                     for line in response:
@@ -353,20 +415,73 @@ def create_app(
                             break
                         if line.startswith(b"data:"):
                             chunk = line[5:].strip()
+                            if decorate and chunk == b"[DONE]" and held_finish is None:
+                                if held_usage is not None:
+                                    yield held_usage
+                                    held_usage = None
+                            if decorate and chunk == b"[DONE]" and held_finish is not None:
+                                # Every frame is in: stamp the held finish
+                                # frame with this request's numbers.
+                                envelope = close_out()
+                                event = held_finish
+                                if "usage" not in event:
+                                    event["usage"] = {
+                                        "prompt_tokens": envelope["prompt_tokens"],
+                                        "completion_tokens": envelope["completion_tokens"],
+                                        "total_tokens": envelope["prompt_tokens"]
+                                        + envelope["completion_tokens"],
+                                        "prompt_tokens_details": {
+                                            "cached_tokens": envelope["cached_tokens"]
+                                        },
+                                    }
+                                event["mtplx_stats"] = telemetry.chat_stats(envelope)
+                                yield f"data: {json.dumps(event)}\n\n".encode()
+                                held_finish = None
+                                if held_usage is not None:
+                                    yield held_usage
+                                    held_usage = None
+                                yield line
+                                continue
                             if chunk and chunk != b"[DONE]":
                                 try:
                                     event = json.loads(chunk)
                                 except ValueError:
                                     event = None
                                 if isinstance(event, dict):
-                                    if _has_text_delta(event):
+                                    if upstream_id is None and isinstance(event.get("id"), str):
+                                        upstream_id = event["id"]
+                                        telemetry.alias(entry, upstream_id)
+                                    text = _has_text_delta(event)
+                                    if text:
                                         telemetry.token(entry)
                                     got = _usage(event)
                                     if any(got):
                                         prompt, completion, cached = got
                                     if swallow_usage_frame and _is_usage_only(event):
                                         continue  # we asked for it, not the client
+                                    if decorate and _is_usage_only(event):
+                                        held_usage = line + b"\n"
+                                        continue
+                                    if decorate and _finish_reason(event):
+                                        held_finish = event
+                                        continue
+                                    if decorate and text:
+                                        yield line
+                                        now = time.perf_counter()
+                                        if now - last_progress >= PROGRESS_FRAME_S:
+                                            last_progress = now
+                                            yield b"\n" + progress_frame(
+                                                upstream_id or entry.request_id,
+                                                event.get("created"),
+                                                event.get("model"),
+                                            )
+                                        continue
                         yield line
+                # Upstream closed without [DONE]; still deliver what was held.
+                if held_finish is not None:
+                    yield f"data: {json.dumps(held_finish)}\n\n".encode()
+                if held_usage is not None:
+                    yield held_usage
             except urllib.error.HTTPError as error:
                 yield b"data: " + error.read() + b"\n\n"
             except (OSError, urllib.error.URLError) as error:
@@ -377,14 +492,8 @@ def create_app(
                 cancelled = True
                 raise
             finally:
-                telemetry.finish(
-                    entry,
-                    status=engine.status(),
-                    prompt_tokens=prompt or None,
-                    completion_tokens=completion or None,
-                    cached_tokens=cached,
-                    cancelled=cancelled,
-                )
+                if not finished:
+                    close_out()
 
         return StreamingResponse(
             stream(),

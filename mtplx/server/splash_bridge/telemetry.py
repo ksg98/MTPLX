@@ -162,6 +162,9 @@ class BridgeTelemetry:
         self._sessions: collections.OrderedDict[str, dict[str, Any]] = (
             collections.OrderedDict()
         )
+        # Splash's own response id (chatcmpl-...) -> our request id. Clients
+        # cancel by the id they saw on the stream, which is Splash's.
+        self._aliases: dict[str, str] = {}
 
     # -- request accounting ------------------------------------------------
 
@@ -374,6 +377,9 @@ class BridgeTelemetry:
                 while len(self._sessions) > TRACKED_SESSIONS:
                     self._sessions.popitem(last=False)
         self.dashboard.progress_events.forget(trace.request_id)
+        with self._lock:
+            for alias in [k for k, v in self._aliases.items() if v == trace.request_id]:
+                del self._aliases[alias]
         self.dashboard.bus.publish(
             {"kind": "completed", "when_s": time.time(), "envelope": dict(envelope)}
         )
@@ -391,9 +397,48 @@ class BridgeTelemetry:
             }
         )
 
+    def alias(self, trace: RequestTrace, upstream_id: str) -> None:
+        """Let a cancel addressed to Splash's response id reach this request."""
+        with self._lock:
+            self._aliases[upstream_id] = trace.request_id
+
     def cancel(self, request_id: str) -> bool:
         """Trip the request's cancel flag; the proxy loop closes the upstream."""
+        with self._lock:
+            request_id = self._aliases.get(request_id, request_id)
         return self.dashboard.in_flight.cancel(request_id)
+
+    @staticmethod
+    def chat_stats(envelope: dict[str, Any]) -> dict[str, Any]:
+        """The `mtplx_stats` block the MLX engine puts on its finish frame.
+
+        The app's chat reads it for the per-reply footer (tok/s, TTFT) and the
+        held header reading, so a Splash reply carries the same keys.
+        """
+        stats: dict[str, Any] = {
+            "generation_mode": "splash",
+            "draft": "dflash2",
+            "prompt_tokens": envelope.get("prompt_tokens"),
+            "completion_tokens": envelope.get("completion_tokens"),
+            "cached_tokens": envelope.get("cached_tokens"),
+            "new_prefill_tokens": envelope.get("new_prefill_tokens"),
+            "ttft_s": envelope.get("ttft_s"),
+            "request_elapsed_s": envelope.get("elapsed_s"),
+            "decode_elapsed_s": envelope.get("decode_elapsed_s"),
+            "prompt_eval_time_s": envelope.get("prompt_eval_time_s"),
+            "prefill_tok_s": envelope.get("prefill_tok_s"),
+            "session_cache_hit": envelope.get("session_cache_hit"),
+            "drafted_tokens": envelope.get("drafted_tokens"),
+            "accepted_drafts": envelope.get("accepted_drafts"),
+            "draft_acceptance_rate": envelope.get("draft_acceptance_rate"),
+            "kv_quantization_bits": envelope.get("kv_quantization_bits"),
+        }
+        tok_s = envelope.get("decode_tok_s")
+        if tok_s:
+            stats["raw_decode_tok_s"] = tok_s
+            stats["decode_tok_s"] = tok_s
+            stats["display_decode_tok_s"] = tok_s
+        return {key: value for key, value in stats.items() if value is not None}
 
     @property
     def active_requests(self) -> int:
