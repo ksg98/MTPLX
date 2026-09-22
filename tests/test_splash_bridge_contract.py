@@ -651,6 +651,110 @@ def test_reasoning_wins_over_the_legacy_thinking_flag():
     assert settings.reasoning == "off"
 
 
+QWEN38_EFFORTS = (("xhigh", "medium", "low"), "xhigh")
+
+
+@pytest.fixture()
+def effort_client(fake_splash):
+    """A bridge whose package template takes Qwen 3.8's effort levels."""
+    from mtplx.server.splash_bridge.settings import SamplingSettings
+
+    install = SplashInstall.discover()
+    engine = _StubEngine(install, MODEL, port=fake_splash)
+    engine.start()
+    app = create_app(
+        install=install,
+        engine=engine,
+        telemetry=BridgeTelemetry(MODEL),
+        sampling=SamplingSettings(efforts=lambda: QWEN38_EFFORTS),
+    )
+    with TestClient(app) as http:
+        yield http
+
+
+def test_the_packages_thinking_levels_are_advertised(effort_client):
+    """The app's panel shows an effort picker, and the chat bar its Thinking
+    selector, only when the reasoning policy lists levels."""
+    policy = effort_client.get("/v1/mtplx/settings").json()["reasoning_policy"]
+    assert policy["supported"] is True
+    assert policy["modes"] == ["auto", "on", "off"]
+    assert policy["effort_levels"] == ["xhigh", "medium", "low"]
+    assert policy["default_effort"] == "xhigh", "Splash's template default"
+    controls = effort_client.get("/health").json()["model_controls"]
+    assert controls["reasoning"] == policy
+
+
+def test_a_chosen_thinking_level_reaches_splash(effort_client):
+    written = effort_client.post(
+        "/v1/mtplx/settings", json={"reasoning_effort": "medium"}
+    ).json()
+    assert written["reasoning_effort"] == "medium"
+    RECEIVED.clear()
+    effort_client.post(
+        "/v1/chat/completions",
+        json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert RECEIVED[-1]["reasoning_effort"] == "medium"
+    # Off still wins: a level is how hard to think, not whether to.
+    effort_client.post("/v1/mtplx/settings", json={"reasoning": "off"})
+    RECEIVED.clear()
+    effort_client.post(
+        "/v1/chat/completions",
+        json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert RECEIVED[-1]["reasoning_effort"] == "none"
+
+
+def test_effort_vocabulary_matches_splash(effort_client):
+    report = effort_client.post(
+        "/v1/mtplx/settings", json={"reasoning_effort": "high"}
+    ).json()
+    assert report["reasoning_effort"] == "xhigh", "Splash folds high into xhigh"
+    report = effort_client.post(
+        "/v1/mtplx/settings", json={"reasoning_effort": "banana"}
+    ).json()
+    assert "reasoning_effort" in report["ignored"]
+    assert report["reasoning_effort"] == "xhigh"
+    # MTPLX's "auto" means the default level; Splash would refuse the word.
+    effort_client.post("/v1/mtplx/settings", json={"reasoning_effort": "auto"})
+    RECEIVED.clear()
+    effort_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "auto",
+        },
+    )
+    assert "reasoning_effort" not in RECEIVED[-1]
+
+
+def test_a_model_without_levels_takes_no_effort():
+    from mtplx.server.splash_bridge.settings import SamplingSettings
+
+    settings = SamplingSettings()
+    report = settings.update({"reasoning_effort": "low"})
+    assert "reasoning_effort" in report["ignored"]
+    sent = settings.apply("/v1/chat/completions", {"messages": []})
+    assert "reasoning_effort" not in sent
+
+
+def test_the_chat_bar_has_the_thinking_selector_on_both_engines(client):
+    from mtplx.server.chat_page import chat_ui_html
+
+    mlx_page = chat_ui_html(
+        model_id=MODEL,
+        server_url="http://testserver",
+        api_key_required=False,
+        default_settings={"depth": 3, "depth_max": 3},
+    )
+    for page in (client.get("/").text, mlx_page):
+        assert 'id="think-pill"' in page and 'id="composer-think"' in page
+        # Built from the loaded model's policy, and sent with each turn.
+        assert "payload.reasoning_policy" in page
+        assert "requestBody.reasoning_effort = settingsNow.reasoning_effort" in page
+
+
 def test_live_settings_fill_what_the_app_chat_leaves_out(client):
     """The app's chat sends no sampling fields; the panel's values must reach
     the engine rather than Splash's built-in defaults."""

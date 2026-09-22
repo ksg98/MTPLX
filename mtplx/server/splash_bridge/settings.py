@@ -15,7 +15,7 @@ write says what moved, so a panel always shows what the engine will use.
 from __future__ import annotations
 
 import threading
-from typing import Any
+from typing import Any, Callable
 
 # Splash's own defaults (its server's frontend), in force until a client
 # changes them.
@@ -27,6 +27,14 @@ TOP_P_MIN = 0.01
 TOP_K_MIN = 1
 TOP_K_MAX = 32
 REASONING_MODES = ("auto", "on", "off")
+# "auto" is MTPLX's "the model's default level", not a level Splash knows.
+EFFORT_AUTO = "auto"
+# What Splash itself folds into its template's levels.
+EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
+
+# The package's effort levels and the template's default, read per call so a
+# model switch is followed: ``((), None)`` when the template has none.
+EffortPolicy = Callable[[], "tuple[tuple[str, ...], str | None]"]
 
 # Settings MTPLX clients send that describe the MLX engine. Accepted so a
 # client syncing its whole panel is not refused, and named in the reply.
@@ -40,7 +48,6 @@ ENGINE_FIXED = {
     "prefill_chunk_tokens": "Splash sizes prefill from its compiled geometry.",
     "stream_interval": "Splash streams every token.",
     "reasoning_parser": "Splash parses Qwen thinking itself.",
-    "reasoning_effort": "Set reasoning to on, off or auto instead.",
 }
 PENALTIES = ("presence_penalty", "frequency_penalty")
 
@@ -57,13 +64,33 @@ def _number(value: Any) -> float | None:
 class SamplingSettings:
     """Live defaults, shared by every client of one bridge process."""
 
-    def __init__(self) -> None:
+    def __init__(self, efforts: EffortPolicy | None = None) -> None:
         self._lock = threading.Lock()
+        self._efforts = efforts or (lambda: ((), None))
         self.temperature = DEFAULT_TEMPERATURE
         self.top_p = DEFAULT_TOP_P
         self.top_k = DEFAULT_TOP_K
         self.max_response_tokens: int | None = None
         self.reasoning = "auto"
+        self.reasoning_effort = EFFORT_AUTO
+
+    def reasoning_policy(self) -> dict[str, Any]:
+        """The reasoning block of MTPLX's model controls, for this package.
+
+        The app's parameter panel shows an effort picker when it lists
+        levels, and the browser chat builds its Thinking selector from it.
+        """
+        levels, default = self._efforts()
+        return {
+            "supported": True,
+            "parser": "qwen3",
+            "display_name": "Qwen think tags",
+            "modes": list(REASONING_MODES),
+            "default_mode": "auto",
+            "default": "auto",
+            "effort_levels": list(levels),
+            "default_effort": default,
+        }
 
     def payload(self) -> dict[str, Any]:
         """The fields of the MLX server's settings reply that apply to Splash."""
@@ -76,6 +103,8 @@ class SamplingSettings:
                 "frequency_penalty": 0.0,
                 "max_response_tokens": self.max_response_tokens,
                 "reasoning": self.reasoning,
+                "reasoning_effort": self.reasoning_effort,
+                "reasoning_policy": self.reasoning_policy(),
                 "enable_thinking": self.reasoning != "off",
                 "sampling_defaults": {
                     "temperature": DEFAULT_TEMPERATURE,
@@ -146,6 +175,17 @@ class SamplingSettings:
                         ignored[key] = "Must be auto, on or off."
                         continue
                     self.reasoning = applied[key] = value
+                elif key == "reasoning_effort":
+                    effort = EFFORT_ALIASES.get(str(value).lower(), str(value).lower())
+                    levels, _default = self._efforts()
+                    if effort != EFFORT_AUTO and effort not in levels:
+                        ignored[key] = (
+                            "This model's levels are "
+                            + (", ".join(levels) if levels else "none")
+                            + "."
+                        )
+                        continue
+                    self.reasoning_effort = applied[key] = effort
                 elif key == "enable_thinking":
                     if patch.get("reasoning") is not None:
                         continue  # the three-way setting says it exactly
@@ -177,6 +217,7 @@ class SamplingSettings:
             }
             max_tokens = self.max_response_tokens
             reasoning = self.reasoning
+            effort = self.reasoning_effort
         for key, value in defaults.items():
             if out.get(key) is None:
                 out[key] = value
@@ -186,6 +227,10 @@ class SamplingSettings:
             out.get(key) is None for key in ("max_tokens", "max_completion_tokens")
         ):
             out["max_tokens"] = max_tokens
+        if out.get("reasoning_effort") == EFFORT_AUTO:
+            # MTPLX clients may say "auto" for "the default level"; Splash
+            # would refuse it, and leaving it out means exactly that.
+            del out["reasoning_effort"]
         # Splash turns thinking off with reasoning_effort "none" and ignores
         # MTPLX's enable_thinking, so "Hide thinking" has to be translated.
         if out.get("reasoning_effort") is None:
@@ -197,4 +242,6 @@ class SamplingSettings:
                 thinking = {"on": True, "off": False}.get(reasoning)
             if thinking is False:
                 out["reasoning_effort"] = "none"
+            elif effort != EFFORT_AUTO and effort in self._efforts()[0]:
+                out["reasoning_effort"] = effort
         return out

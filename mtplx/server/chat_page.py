@@ -489,6 +489,34 @@ def chat_ui_html(
     .send-btn svg { width: 16px; height: 16px; }
     .send-btn.stop { background: var(--error); }
     .send-btn.stop:hover { background: #f47e7e; }
+    .composer-actions { display: flex; align-items: center; gap: 4px; }
+    .think-pill {
+      position: relative;
+      display: inline-flex; align-items: center; gap: 6px;
+      height: 36px; padding: 0 24px 0 10px;
+      border-radius: 9px;
+      color: var(--muted); font-size: 13px; white-space: nowrap;
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+    }
+    .think-pill[hidden] { display: none; }
+    .think-pill:hover, .think-pill:focus-within { background: var(--surface-2); color: var(--text); }
+    .think-pill.off { color: var(--muted-2); }
+    .think-pill select {
+      appearance: none; -webkit-appearance: none;
+      border: 0; background: transparent; color: inherit;
+      font: inherit; font-weight: 600;
+      padding: 0; outline: none; cursor: pointer;
+    }
+    .think-pill select option { background: var(--surface); color: var(--text); }
+    .think-pill::after {
+      content: ""; position: absolute; right: 10px; top: 50%;
+      width: 5px; height: 5px;
+      border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+      transform: translateY(-70%) rotate(45deg);
+      pointer-events: none;
+    }
+    @media (max-width: 480px) { .think-label { display: none; } }
 
     @media (max-width: 900px) {
       header.topbar { padding: 0 12px; }
@@ -599,9 +627,15 @@ def chat_ui_html(
         <form id="chat-form" autocomplete="off">
           <div class="composer-box">
             <textarea id="prompt" placeholder="Message MTPLX (Enter to send · Shift+Enter for newline)" rows="1" autofocus></textarea>
-            <button id="send" class="send-btn" type="submit" aria-label="Send">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
-            </button>
+            <div class="composer-actions">
+              <label id="think-pill" class="think-pill" title="How much the model thinks before it answers" hidden>
+                <span class="think-label">Thinking</span>
+                <select id="composer-think" aria-label="Thinking"></select>
+              </label>
+              <button id="send" class="send-btn" type="submit" aria-label="Send">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+              </button>
+            </div>
           </div>
         </form>
       </div>
@@ -739,6 +773,74 @@ def chat_ui_html(
     for (const key of Object.keys(LOCKED_CONTROLS)) {
       if (ctlEls[key]) ctlEls[key].disabled = true;
     }
+
+    // ---------- thinking (chat bar) ------------------------------------------
+    // The sidebar's reasoning setting, next to Send. A model whose template
+    // takes effort levels lists them; the loaded model's policy arrives with
+    // /v1/mtplx/settings, and a model without thinking hides the selector.
+    const thinkPillEl = document.getElementById("think-pill");
+    const composerThinkEl = document.getElementById("composer-think");
+    const EFFORT_LABELS = {xhigh: "XHigh", high: "High", medium: "Medium", low: "Low"};
+    let reasoningPolicy = null;
+    let currentEffort = "auto";
+    function effortLevels() {
+      const levels = reasoningPolicy && Array.isArray(reasoningPolicy.effort_levels)
+        ? reasoningPolicy.effort_levels
+        : [];
+      return levels.map(String);
+    }
+    function normalizeEffort(value) {
+      const effort = String(value || "auto");
+      return effortLevels().includes(effort) ? effort : "auto";
+    }
+    function renderThinkOptions() {
+      const supported = Boolean(reasoningPolicy) && reasoningPolicy.supported !== false;
+      thinkPillEl.hidden = !supported;
+      if (!supported) return;
+      const options = [["auto", "Auto"]];
+      const levels = effortLevels();
+      if (levels.length) {
+        for (const level of levels) {
+          options.push([level, EFFORT_LABELS[level] || level.charAt(0).toUpperCase() + level.slice(1)]);
+        }
+      } else {
+        options.push(["on", "On"]);
+      }
+      options.push(["off", "Off"]);
+      const signature = JSON.stringify(options);
+      if (composerThinkEl.dataset.signature === signature) return;
+      composerThinkEl.dataset.signature = signature;
+      composerThinkEl.innerHTML = options
+        .map(([value, label]) => '<option value="' + value + '">' + escapeHtml(label) + "</option>")
+        .join("");
+    }
+    function showThinkChoice() {
+      const reasoning = ctlEls.reasoning.value;
+      let choice = reasoning === "on" ? "on" : "auto";
+      if (reasoning === "off") choice = "off";
+      else if (effortLevels().length) choice = normalizeEffort(currentEffort);
+      if ([...composerThinkEl.options].some((option) => option.value === choice)) {
+        composerThinkEl.value = choice;
+      }
+      thinkPillEl.classList.toggle("off", choice === "off");
+    }
+    composerThinkEl.addEventListener("change", () => {
+      const choice = composerThinkEl.value;
+      if (choice === "off" || choice === "on") {
+        ctlEls.reasoning.value = choice;
+      } else if (choice === "auto") {
+        currentEffort = "auto";
+        if (ctlEls.reasoning.value === "off" || !effortLevels().length) ctlEls.reasoning.value = "auto";
+      } else {
+        // Picking how hard to think is asking for thinking.
+        currentEffort = choice;
+        if (ctlEls.reasoning.value === "off") ctlEls.reasoning.value = "on";
+      }
+      lastLocalSettingsEditAt = performance.now();
+      settings = readSettings();
+      saveSettings(settings);
+      scheduleDaemonSettingsSync(settings, {immediate: true});
+    });
     function loadStoredSystemPrompt() {
       try {
         const raw = window.localStorage.getItem(SETTINGS_KEY);
@@ -755,6 +857,10 @@ def chat_ui_html(
     }
     function settingsFromDaemonPayload(payload) {
       payload = payload || {};
+      if (payload.reasoning_policy && typeof payload.reasoning_policy === "object") {
+        reasoningPolicy = payload.reasoning_policy;
+        renderThinkOptions();
+      }
       const rawMode = payload.generation_mode == null ? "" : String(payload.generation_mode);
       const mode = rawMode.toLowerCase();
       if (payload.depth_max) {
@@ -770,12 +876,13 @@ def chat_ui_html(
         depth: payload.depth,
         max_tokens: payload.max_response_tokens == null ? DEFAULTS.max_tokens : payload.max_response_tokens,
         reasoning: payload.reasoning || DEFAULTS.reasoning,
+        reasoning_effort: payload.reasoning_effort || "auto",
         system: loadStoredSystemPrompt()
       });
     }
     function daemonSettingsPayload(s) {
       const normalized = normalizeSettings(s || {});
-      return {
+      const payload = {
         temperature: normalized.temperature,
         top_p: normalized.top_p,
         top_k: normalized.top_k,
@@ -785,6 +892,8 @@ def chat_ui_html(
         max_response_tokens: normalized.max_tokens,
         reasoning: normalized.reasoning
       };
+      if (effortLevels().length) payload.reasoning_effort = normalized.reasoning_effort;
+      return payload;
     }
     function daemonSettingsSignature(s) {
       return JSON.stringify(daemonSettingsPayload(s));
@@ -819,6 +928,7 @@ def chat_ui_html(
         depth: clamp(s.depth, RANGES.depth.min, RANGES.depth.max, DEFAULTS.depth, true),
         max_tokens: clamp(s.max_tokens, RANGES.max_tokens.min, RANGES.max_tokens.max, DEFAULTS.max_tokens, true),
         reasoning: ["auto", "on", "off"].includes(String(s.reasoning || "")) ? String(s.reasoning) : DEFAULTS.reasoning,
+        reasoning_effort: normalizeEffort(s.reasoning_effort),
         system: String(s.system || "")
       };
       return Object.assign(normalized, LOCKED_CONTROLS);
@@ -833,6 +943,7 @@ def chat_ui_html(
       ctlEls.depth.value = normalized.depth;
       ctlEls.max_tokens.value = normalized.max_tokens;
       ctlEls.reasoning.value = normalized.reasoning;
+      currentEffort = normalized.reasoning_effort;
       ctlEls.system.value = normalized.system;
       refreshLabels();
       refreshSliderFills();
@@ -912,6 +1023,7 @@ def chat_ui_html(
       valEls.depth.textContent = mtpOn ? String(parseInt(ctlEls.depth.value, 10) || 0) : "off";
       const mt = parseInt(ctlEls.max_tokens.value, 10) || 0;
       valEls.max_tokens.textContent = mt >= 1000 ? (mt / 1000).toFixed(1).replace(/\\.0$/, "") + "k" : String(mt);
+      showThinkChoice();
     }
     function refreshSliderFills() {
       for (const key of ["temperature", "top_p", "top_k", "presence_penalty", "depth", "max_tokens"]) {
@@ -938,6 +1050,7 @@ def chat_ui_html(
         depth: clamp(ctlEls.depth.value, RANGES.depth.min, RANGES.depth.max, DEFAULTS.depth, true),
         max_tokens: clamp(ctlEls.max_tokens.value, RANGES.max_tokens.min, RANGES.max_tokens.max, DEFAULTS.max_tokens, true),
         reasoning: ctlEls.reasoning.value || "auto",
+        reasoning_effort: normalizeEffort(currentEffort),
         system: (ctlEls.system.value || "").trim()
       };
       refreshLabels();
@@ -1305,6 +1418,9 @@ def chat_ui_html(
         if (settingsNow.top_k > 0) requestBody.top_k = settingsNow.top_k;
         if (settingsNow.reasoning === "on") requestBody.enable_thinking = true;
         else if (settingsNow.reasoning === "off") requestBody.enable_thinking = false;
+        if (settingsNow.reasoning !== "off" && effortLevels().includes(settingsNow.reasoning_effort)) {
+          requestBody.reasoning_effort = settingsNow.reasoning_effort;
+        }
 
         armStallWatchdog();
         const response = await fetch("/v1/chat/completions", {

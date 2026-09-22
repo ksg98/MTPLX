@@ -104,6 +104,14 @@ reason, so every panel shows what the engine will actually use. MTPLX's
 `top_k: 0` (no filter) becomes 32, Splash's widest, not a greedy 1. "Hide
 thinking" reaches Splash as `reasoning_effort: "none"`, the switch it reads.
 
+The chat bar has a **Thinking** selector beside Send, on both engines, bound
+to the same reasoning setting as the sidebar. Its choices come from the
+loaded model's reasoning policy: Qwen 3.8 lists Auto, XHigh, Medium, Low and
+Off, a model without effort levels Auto, On and Off, and a model without
+thinking hides it. On Splash the levels are read from the package's chat
+template, whose default (Auto) is XHigh; the app's parameter panel gets the
+same effort picker from the same policy.
+
 With an API key set, the MLX server's browser sign-in (`/mtplx/browser-auth`)
 is not bridged yet, so open the page on a keyless local server.
 

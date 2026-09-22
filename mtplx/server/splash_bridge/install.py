@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -186,6 +187,28 @@ class SplashInstall:
     def is_installed(self, model_id: str) -> bool:
         """True once Splash has verified the package against its manifest."""
         return (self.package_root(model_id) / "manifest.json").is_file()
+
+    def reasoning_efforts(self, model_id: str) -> tuple[tuple[str, ...], str | None]:
+        """The thinking-effort levels the package's chat template accepts.
+
+        Splash hands ``reasoning_effort`` to the template, so the levels are
+        whatever the template checks for, and its default is what it falls
+        back to when a request names none (Qwen 3.8: xhigh, medium, low;
+        xhigh). ``((), None)`` for a template without effort levels.
+        """
+        try:
+            template = (
+                self.package_root(model_id) / "tokenizer" / "chat_template.jinja"
+            ).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return (), None
+        allowed = re.search(r"reasoning_effort\s+not\s+in\s*\(([^)]*)\)", template)
+        if allowed is None:
+            return (), None
+        levels = tuple(re.findall(r"['\"](\w+)['\"]", allowed.group(1)))
+        default = re.search(r"reasoning_effort\s*\|\s*default\(\s*['\"](\w+)['\"]", template)
+        fallback = default.group(1) if default and default.group(1) in levels else None
+        return levels, fallback
 
     def draft_tokens(self, model_id: str) -> int | None:
         """How many tokens the package's DFlash 2 draft proposes per verify.

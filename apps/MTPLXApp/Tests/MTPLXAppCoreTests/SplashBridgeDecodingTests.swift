@@ -131,6 +131,22 @@ final class SplashBridgeDecodingTests: XCTestCase {
         XCTAssertEqual(updated.presencePenalty, 0)
         XCTAssertEqual(updated.reasoning, "on")
         XCTAssertEqual(updated.generationMode, "splash")
+        XCTAssertEqual(updated.reasoningEffort, "low")
+    }
+
+    /// The params panel shows its effort picker when the reasoning policy
+    /// lists levels; Splash's come from the package's own chat template.
+    func testSplashAdvertisesItsThinkingLevels() throws {
+        let settings = try decoder.decode(
+            MutableSettings.self, from: fixture("splash_mtplx_settings")
+        )
+        let policy = try XCTUnwrap(settings.reasoningPolicy)
+        XCTAssertTrue(policy.supported)
+        XCTAssertEqual(policy.modes, ["auto", "on", "off"])
+        XCTAssertEqual(policy.effortLevels, ["xhigh", "medium", "low"])
+        XCTAssertEqual(policy.defaultEffort, "xhigh")
+        let health = try decoder.decode(HealthPayload.self, from: fixture("splash_health"))
+        XCTAssertEqual(health.startup?.modelControls?.reasoning, policy)
     }
 
     func testRemainingContractEndpointsDecode() throws {

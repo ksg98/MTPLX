@@ -228,7 +228,14 @@ def create_app(
     # Resolved once: /health is polled continuously by the app's liveness
     # probe, and this shells out to `splash --version`.
     splash_version = install.version()
-    sampling = sampling or SamplingSettings()
+    # A package's files never change while it is installed, and the chat page
+    # polls settings every 1.5 s: read each package's template and manifest
+    # once.
+    efforts_for = functools.lru_cache(maxsize=8)(install.reasoning_efforts)
+    draft_tokens_for = functools.lru_cache(maxsize=8)(install.draft_tokens)
+    sampling = sampling or SamplingSettings(
+        efforts=lambda: efforts_for(engine.model_id)
+    )
 
     # -- helpers ----------------------------------------------------------
 
@@ -276,6 +283,7 @@ def create_app(
             "support_level": "verified",
             "display_name": engine.model_id.split("/")[-1],
             "draft_control": {"supported": False},
+            "reasoning": sampling.reasoning_policy(),
             "sampling": {
                 "temperature": DEFAULT_TEMPERATURE,
                 "top_p": DEFAULT_TOP_P,
@@ -664,7 +672,7 @@ def create_app(
         passes through the bridge and lands in the dashboard's telemetry.
         """
         settings = sampling.payload()
-        draft = install.draft_tokens(engine.model_id) or DEFAULT_DRAFT_TOKENS
+        draft = draft_tokens_for(engine.model_id) or DEFAULT_DRAFT_TOKENS
         return HTMLResponse(
             chat_ui_html(
                 model_id=engine.model_id,
@@ -782,7 +790,7 @@ def create_app(
             "model": engine.model_id,
             **telemetry.settings(),
             **sampling.payload(),
-            "draft_tokens": install.draft_tokens(engine.model_id),
+            "draft_tokens": draft_tokens_for(engine.model_id),
         }
 
     @app.get("/v1/mtplx/settings")
